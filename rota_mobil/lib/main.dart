@@ -1,5 +1,6 @@
 import 'dart:convert';
-import 'dart:ui'; // Buzlu cam efekti için eklendi
+import 'dart:ui';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -38,6 +39,7 @@ class AnaEkran extends StatefulWidget {
 class _AnaEkranState extends State<AnaEkran> {
   int _seciliSayfa = 0;
   List<Map<String, dynamic>> _rotamListesi = [];
+  bool _isOptimized = false;
 
   void _rotayaEkleCikar(Map<String, dynamic> mekan) {
     setState(() {
@@ -69,11 +71,15 @@ class _AnaEkranState extends State<AnaEkran> {
         HaritaEkrani(
           rotamListesi: _rotamListesi,
           rotayaEkleCikar: _rotayaEkleCikar,
+          isOptimized: _isOptimized,
+          onToggleOptimize: (val) => setState(() => _isOptimized = val),
         ),
         RotamEkrani(
           rotamListesi: _rotamListesi,
           rotayaEkleCikar: _rotayaEkleCikar,
           rotayiYenidenSirala: _rotayiYenidenSirala,
+          isOptimized: _isOptimized,
+          onToggleOptimize: (val) => setState(() => _isOptimized = val),
         ),
       ][_seciliSayfa],
       bottomNavigationBar: BottomNavigationBar(
@@ -99,10 +105,15 @@ class _AnaEkranState extends State<AnaEkran> {
 class HaritaEkrani extends StatefulWidget {
   final List<Map<String, dynamic>> rotamListesi;
   final Function(Map<String, dynamic>) rotayaEkleCikar;
+  final bool isOptimized;
+  final Function(bool) onToggleOptimize;
+
   const HaritaEkrani({
     super.key,
     required this.rotamListesi,
     required this.rotayaEkleCikar,
+    required this.isOptimized,
+    required this.onToggleOptimize,
   });
   @override
   State<HaritaEkrani> createState() => _HaritaEkraniState();
@@ -110,11 +121,21 @@ class HaritaEkrani extends StatefulWidget {
 
 class _HaritaEkraniState extends State<HaritaEkrani> {
   List<Map<String, dynamic>> _tumMekanlar = [];
-  List<LatLng> _routePoints = [];
+  List<List<LatLng>> _routeSegments = [];
   bool _loading = true;
 
   bool _sadeceRotamiGoster = false;
   List<int> _seciliKategoriler = [];
+
+  final List<Color> _segmentColors = [
+    const Color(0xFF2196F3), // Mavi
+    const Color(0xFF9C27B0), // Mor
+    const Color(0xFFFF9800), // Turuncu
+    const Color(0xFF00BCD4), // Turkuaz
+    const Color(0xFFE91E63), // Pembe
+    const Color(0xFF4CAF50), // Yeşil
+    const Color(0xFFF44336), // Kırmızı
+  ];
 
   @override
   void initState() {
@@ -126,15 +147,61 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
   @override
   void didUpdateWidget(covariant HaritaEkrani oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.rotamListesi != widget.rotamListesi) {
+    if (oldWidget.rotamListesi != widget.rotamListesi ||
+        oldWidget.isOptimized != widget.isOptimized) {
       _fetchGercelRota();
     }
+  }
+
+  // --- İŞTE KUSURSUZ ÇÖZÜM: BEVEL JOINT ALGORİTMASI ---
+  List<LatLng> _calculateSmoothOffset(
+    List<LatLng> points,
+    double offsetMeters,
+  ) {
+    if (points.length < 2) return points;
+    List<LatLng> result = [];
+    const Distance dist = Distance();
+
+    for (int i = 0; i < points.length; i++) {
+      if (i == 0) {
+        double b = dist.bearing(points[0], points[1]);
+        result.add(dist.offset(points[0], offsetMeters, (b + 90) % 360));
+      } else if (i == points.length - 1) {
+        double b = dist.bearing(points[i - 1], points[i]);
+        result.add(dist.offset(points[i], offsetMeters, (b + 90) % 360));
+      } else {
+        double b1 = (dist.bearing(points[i - 1], points[i]) + 360) % 360;
+        double b2 = (dist.bearing(points[i], points[i + 1]) + 360) % 360;
+
+        double angleDiff = (b2 - b1);
+        if (angleDiff < -180) angleDiff += 360;
+        if (angleDiff > 180) angleDiff -= 360;
+
+        // KESİN ÇÖZÜM: BEVEL JOINT (Kırık ve Kopukları Engeller)
+        if (angleDiff.abs() > 90) {
+          // Keskin dönüşlerde boşluk kalmaması için geliş ve gidiş yönlerine iki ayrı köşe noktası ekliyoruz
+          result.add(dist.offset(points[i], offsetMeters, (b1 + 90) % 360));
+          result.add(dist.offset(points[i], offsetMeters, (b2 + 90) % 360));
+          continue;
+        }
+
+        double bisector = (b1 + angleDiff / 2 + 90) % 360;
+        double miterMult = 1 / math.cos((angleDiff / 2) * math.pi / 180);
+
+        if (miterMult.abs() > 2.0) miterMult = 2.0 * miterMult.sign;
+
+        result.add(
+          dist.offset(points[i], offsetMeters * miterMult.abs(), bisector),
+        );
+      }
+    }
+    return result;
   }
 
   Future<void> _fetchGercelRota() async {
     if (widget.rotamListesi.length < 2) {
       setState(() {
-        _routePoints = [];
+        _routeSegments = [];
       });
       return;
     }
@@ -142,38 +209,54 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
     final String coordinatesString = widget.rotamListesi
         .map((m) => "${m['boylam']},${m['enlem']}")
         .join(";");
+    String unrestrictedStr = List.filled(
+      widget.rotamListesi.length,
+      "unrestricted",
+    ).join(";");
 
-    Uri url;
-    bool isSimpleRoute = widget.rotamListesi.length == 2;
+    String mode = widget.isOptimized ? "trip" : "route";
+    String params = widget.isOptimized
+        ? "roundtrip=false&source=first&destination=last&steps=true&geometries=geojson&overview=false&approaches=$unrestrictedStr"
+        : "steps=true&geometries=geojson&overview=false&continue_straight=false&approaches=$unrestrictedStr";
 
-    if (isSimpleRoute) {
-      url = Uri.parse(
-        'https://router.project-osrm.org/route/v1/foot/$coordinatesString?overview=full&geometries=geojson',
-      );
-    } else {
-      url = Uri.parse(
-        'https://router.project-osrm.org/trip/v1/foot/$coordinatesString?roundtrip=false&source=first&destination=last&overview=full&geometries=geojson',
-      );
-    }
+    final url = Uri.parse(
+      'https://router.project-osrm.org/$mode/v1/foot/$coordinatesString?$params',
+    );
 
     try {
       final response = await http.get(url);
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        List<dynamic> rawCoordinates;
+        final items = widget.isOptimized ? data['trips'] : data['routes'];
+        final legs = items[0]['legs'] as List;
 
-        if (isSimpleRoute) {
-          rawCoordinates = data['routes'][0]['geometry']['coordinates'];
-        } else {
-          rawCoordinates = data['trips'][0]['geometry']['coordinates'];
+        List<List<LatLng>> allSegments = [];
+
+        for (var leg in legs) {
+          List<LatLng> segPoints = [];
+          final steps = leg['steps'] as List;
+          for (var step in steps) {
+            final geometry = step['geometry'];
+            if (geometry != null && geometry['coordinates'] != null) {
+              for (var coord in geometry['coordinates']) {
+                segPoints.add(LatLng(coord[1].toDouble(), coord[0].toDouble()));
+              }
+            }
+          }
+
+          if (segPoints.length > 1) {
+            // Paralel şerit mesafesini çok daha hassas (0.8m) ayarladık
+            double dynamicOffset = 0.8 + ((allSegments.length % 4) * 0.5);
+            List<LatLng> shiftedSegment = _calculateSmoothOffset(
+              segPoints,
+              dynamicOffset,
+            );
+            allSegments.add(shiftedSegment);
+          }
         }
 
-        List<LatLng> points = rawCoordinates
-            .map((coord) => LatLng(coord[1].toDouble(), coord[0].toDouble()))
-            .toList();
-
         setState(() {
-          _routePoints = points;
+          _routeSegments = allSegments;
         });
       }
     } catch (e) {
@@ -196,64 +279,95 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
     }
   }
 
-  Widget _buildPin(String code, bool isSelected, int stepNumber) {
+  List<Marker> _buildDirectionalArrows() {
+    List<Marker> arrows = [];
+    final Distance distanceTool = const Distance();
+
+    for (int s = 0; s < _routeSegments.length; s++) {
+      var segmentPoints = _routeSegments[s];
+      if (segmentPoints.length < 2) continue;
+
+      int step = 8;
+
+      for (int i = 0; i < segmentPoints.length - 1; i += step) {
+        LatLng p1 = segmentPoints[i];
+        int nextIndex = (i + 2 < segmentPoints.length)
+            ? i + 2
+            : segmentPoints.length - 1;
+        if (nextIndex == i) break;
+
+        LatLng p2 = segmentPoints[nextIndex];
+
+        double bearingDeg = distanceTool.bearing(p1, p2);
+        double bearingRads = bearingDeg * math.pi / 180;
+
+        arrows.add(
+          Marker(
+            point: p1,
+            width: 24,
+            height: 24,
+            alignment: Alignment.center,
+            child: Transform.rotate(
+              angle: bearingRads,
+              child: const Icon(
+                Icons.keyboard_double_arrow_up_rounded,
+                color: Colors.white,
+                size: 18,
+                shadows: [
+                  Shadow(
+                    color: Colors.black,
+                    blurRadius: 5,
+                    offset: Offset(0, 1.5),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
+    }
+    return arrows;
+  }
+
+  Widget _buildPin(
+    String code,
+    bool isSelected,
+    int stepNumber,
+    int totalSelected,
+    bool hasCategoryFilter,
+  ) {
     IconData icon;
-    Color color;
+    Color catColor;
     switch (code) {
       case 'mosque':
         icon = Icons.mosque_outlined;
-        color = const Color(0xFF008080);
+        catColor = const Color(0xFF008080);
         break;
       case 'museum':
         icon = Icons.museum_outlined;
-        color = const Color(0xFF8B4513);
+        catColor = const Color(0xFF8B4513);
         break;
       case 'park':
         icon = Icons.park_outlined;
-        color = const Color(0xFF228B22);
+        catColor = const Color(0xFF228B22);
         break;
       case 'water':
         icon = Icons.water_drop_outlined;
-        color = Colors.blue[700]!;
+        catColor = Colors.blue[700]!;
         break;
       case 'school':
         icon = Icons.school_outlined;
-        color = Colors.indigo[800]!;
+        catColor = Colors.indigo[800]!;
         break;
       default:
         icon = Icons.location_on_outlined;
-        color = Colors.red[700]!;
+        catColor = Colors.red[700]!;
     }
 
-    if (isSelected) {
+    if (!isSelected) {
       return Container(
         decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.amberAccent, width: 3.5),
-          boxShadow: const [
-            BoxShadow(
-              color: Colors.black45,
-              blurRadius: 6,
-              offset: Offset(0, 3),
-            ),
-          ],
-        ),
-        child: Center(
-          child: Text(
-            '$stepNumber',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-      );
-    } else {
-      return Container(
-        decoration: BoxDecoration(
-          color: color,
+          color: catColor,
           shape: BoxShape.circle,
           border: Border.all(color: Colors.white, width: 2),
           boxShadow: const [
@@ -266,11 +380,89 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
         ),
         child: Center(child: Icon(icon, color: Colors.white, size: 18)),
       );
+    } else {
+      if (hasCategoryFilter) {
+        return Container(
+          decoration: BoxDecoration(
+            color: catColor,
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.amberAccent, width: 3.5),
+            boxShadow: const [
+              BoxShadow(
+                color: Colors.black45,
+                blurRadius: 6,
+                offset: Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Center(
+            child: Text(
+              '$stepNumber',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                shadows: [Shadow(color: Colors.black87, blurRadius: 4)],
+              ),
+            ),
+          ),
+        );
+      } else {
+        Color prevColor;
+        Color nextColor;
+
+        if (stepNumber == 1) {
+          prevColor = _segmentColors[0];
+          nextColor = _segmentColors[0];
+        } else if (stepNumber == totalSelected) {
+          int segIndex = (stepNumber - 2) % _segmentColors.length;
+          prevColor = _segmentColors[segIndex];
+          nextColor = _segmentColors[segIndex];
+        } else {
+          int prevSegIndex = (stepNumber - 2) % _segmentColors.length;
+          int nextSegIndex = (stepNumber - 1) % _segmentColors.length;
+          prevColor = _segmentColors[prevSegIndex];
+          nextColor = _segmentColors[nextSegIndex];
+        }
+
+        return Container(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: LinearGradient(
+              colors: [prevColor, nextColor],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            border: Border.all(color: Colors.white, width: 3),
+            boxShadow: const [
+              BoxShadow(
+                color: Colors.black54,
+                blurRadius: 6,
+                offset: Offset(0, 3),
+              ),
+            ],
+          ),
+          child: Center(
+            child: Text(
+              '$stepNumber',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                shadows: [Shadow(color: Colors.black87, blurRadius: 4)],
+              ),
+            ),
+          ),
+        );
+      }
     }
   }
 
   List<Marker> _getDynamicMarkers() {
     List<Marker> markers = [];
+    int totalSelected = widget.rotamListesi.length;
+    bool hasCategoryFilter = _seciliKategoriler.isNotEmpty;
+
     for (var m in _tumMekanlar) {
       if (m['enlem'] == null || m['boylam'] == null) continue;
 
@@ -281,23 +473,27 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
       int stepNumber = routeIndex + 1;
 
       if (_sadeceRotamiGoster && !isSelected) continue;
-      if (_seciliKategoriler.isNotEmpty &&
-          !_seciliKategoriler.contains(m['kategori_id']))
+      if (hasCategoryFilter && !_seciliKategoriler.contains(m['kategori_id']))
         continue;
 
       String code = m['kategoriler']?['ikon_kodu'] ?? 'location';
-      m['kategori_adi'] = m['kategoriler']?['kategori_adi'] ?? 'Genel';
 
       markers.add(
         Marker(
           point: LatLng(m['enlem'], m['boylam']),
-          width: isSelected ? 48 : 38,
-          height: isSelected ? 48 : 38,
+          width: isSelected ? 44 : 38,
+          height: isSelected ? 44 : 38,
           child: MouseRegion(
             cursor: SystemMouseCursors.click,
             child: GestureDetector(
               onTap: () => _showSheet(m),
-              child: _buildPin(code, isSelected, stepNumber),
+              child: _buildPin(
+                code,
+                isSelected,
+                stepNumber,
+                totalSelected,
+                hasCategoryFilter,
+              ),
             ),
           ),
         ),
@@ -344,7 +540,7 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
                   ),
                 ),
                 Text(
-                  m['kategori_adi'],
+                  m['kategoriler']?['kategori_adi'] ?? 'Genel',
                   style: TextStyle(
                     color: Colors.indigo[400],
                     fontWeight: FontWeight.w600,
@@ -383,15 +579,13 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
 
   void _toggleKategori(int id) {
     setState(() {
-      if (_seciliKategoriler.contains(id)) {
+      if (_seciliKategoriler.contains(id))
         _seciliKategoriler.remove(id);
-      } else {
+      else
         _seciliKategoriler.add(id);
-      }
     });
   }
 
-  // --- PREMIUM TASARIM DOKUNUŞU: ŞIK BUTON OLUŞTURUCU ---
   Widget _buildPremiumChip(
     String label,
     bool isSelected,
@@ -428,6 +622,43 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
     );
   }
 
+  // BİLGİLENDİRME (İ) POPUP FONKSİYONU
+  void _showInfoDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            Icon(Icons.info_outline, color: Colors.indigo[800]),
+            const SizedBox(width: 10),
+            const Text(
+              "Akıllı Rota",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: const Text(
+          "Oto mod kapalıyken rotayı 'Rotam' sekmesinden kendi istediğiniz sıraya göre dizebilirsiniz.\n\nOto mod açıkken sistem yürüme mesafesini baz alarak en verimli güzergahı otomatik olarak hesaplar ve sıralar.",
+          style: TextStyle(fontSize: 15, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              "Anladım",
+              style: TextStyle(
+                color: Colors.indigo[800],
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -446,36 +677,39 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
                           'https://cartodb-basemaps-{s}.global.ssl.fastly.net/rastertiles/voyager/{z}/{x}/{y}.png',
                       subdomains: const ['a', 'b', 'c', 'd'],
                     ),
+
                     PolylineLayer(
-                      polylines: [
-                        Polyline(
-                          points: _routePoints,
-                          color: Colors.indigo[600]!.withOpacity(0.8),
-                          strokeWidth: 5.0,
-                        ),
-                      ],
+                      polylines: List.generate(_routeSegments.length, (index) {
+                        return Polyline(
+                          points: _routeSegments[index],
+                          color: _segmentColors[index % _segmentColors.length]
+                              .withOpacity(0.95),
+                          strokeWidth: 6.5,
+                          strokeCap: StrokeCap.round,
+                          strokeJoin: StrokeJoin.round,
+                        );
+                      }),
                     ),
+
+                    MarkerLayer(markers: _buildDirectionalArrows()),
                     MarkerLayer(markers: _getDynamicMarkers()),
                   ],
                 ),
 
-                // --- PREMIUM GLASSMORPHISM (BUZLU CAM) MENÜ PANelİ ---
+                // FİLTRE BARI
                 Positioned(
-                  top: 15,
+                  top: 25,
                   left: 15,
-                  right: 15, // Haritadan hafif kopuk, havada süzülen panel
+                  right: 15,
                   child: SafeArea(
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(25),
                       child: BackdropFilter(
-                        filter: ImageFilter.blur(
-                          sigmaX: 12,
-                          sigmaY: 12,
-                        ), // Güçlü Apple stili bulanıklık
+                        filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
                         child: Container(
                           padding: const EdgeInsets.symmetric(vertical: 12),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.45), // Şeffaf cam
+                            color: Colors.white.withOpacity(0.45),
                             borderRadius: BorderRadius.circular(25),
                             border: Border.all(
                               color: Colors.white.withOpacity(0.5),
@@ -548,6 +782,63 @@ class _HaritaEkraniState extends State<HaritaEkrani> {
                     ),
                   ),
                 ),
+
+                // HARİTA EKRANI İÇİN YENİ OTO KONTROL PANELİ VE İNFO BUTONU
+                Positioned(
+                  top: 100,
+                  right: 15,
+                  child: SafeArea(
+                    child: Container(
+                      padding: const EdgeInsets.only(
+                        left: 12,
+                        right: 6,
+                        top: 4,
+                        bottom: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.95),
+                        borderRadius: BorderRadius.circular(30),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black26,
+                            blurRadius: 6,
+                            offset: Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          GestureDetector(
+                            onTap: _showInfoDialog,
+                            child: Icon(
+                              Icons.info_outline,
+                              color: Colors.indigo[400],
+                              size: 22,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            "Oto",
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              color: Colors.indigo[900],
+                            ),
+                          ),
+                          Switch(
+                            value: widget.isOptimized,
+                            onChanged: widget.onToggleOptimize,
+                            activeColor: Colors.amberAccent,
+                            activeTrackColor: Colors.indigo[700],
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
     );
@@ -559,13 +850,53 @@ class RotamEkrani extends StatelessWidget {
   final List<Map<String, dynamic>> rotamListesi;
   final Function(Map<String, dynamic>) rotayaEkleCikar;
   final Function(int, int) rotayiYenidenSirala;
+  final bool isOptimized;
+  final Function(bool) onToggleOptimize;
 
   const RotamEkrani({
     super.key,
     required this.rotamListesi,
     required this.rotayaEkleCikar,
     required this.rotayiYenidenSirala,
+    required this.isOptimized,
+    required this.onToggleOptimize,
   });
+
+  void _showInfoDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            Icon(Icons.info_outline, color: Colors.indigo[800]),
+            const SizedBox(width: 10),
+            const Text(
+              "Akıllı Rota",
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: const Text(
+          "Oto mod kapalıyken rotayı 'Rotam' sekmesinden kendi istediğiniz sıraya göre dizebilirsiniz.\n\nOto mod açıkken sistem yürüme mesafesini baz alarak en verimli güzergahı otomatik olarak hesaplar ve sıralar.",
+          style: TextStyle(fontSize: 15, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              "Anladım",
+              style: TextStyle(
+                color: Colors.indigo[800],
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -583,6 +914,34 @@ class RotamEkrani extends StatelessWidget {
         backgroundColor: Colors.indigo[800],
         elevation: 0,
         centerTitle: true,
+        actions: [
+          Row(
+            children: [
+              GestureDetector(
+                onTap: () => _showInfoDialog(context),
+                child: const Icon(
+                  Icons.info_outline,
+                  color: Colors.white70,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Text(
+                "Oto",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
+              ),
+              Switch(
+                value: isOptimized,
+                activeColor: Colors.amberAccent,
+                onChanged: onToggleOptimize,
+              ),
+            ],
+          ),
+        ],
       ),
       body: rotamListesi.isEmpty
           ? Center(
@@ -607,10 +966,8 @@ class RotamEkrani extends StatelessWidget {
                 ],
               ),
             )
-          // İŞTE YENİ ZIRH: ReorderableDragStartListener ile kartın neresinden tutarsan tut anında havaya kalkar!
           : ReorderableListView.builder(
-              buildDefaultDragHandles:
-                  false, // Tarayıcıdaki bozuk varsayılan sistemi tamamen iptal ettik
+              buildDefaultDragHandles: false,
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
               itemCount: rotamListesi.length,
               onReorder: (oldIndex, newIndex) =>
@@ -619,7 +976,7 @@ class RotamEkrani extends StatelessWidget {
                 elevation: 12,
                 color: Colors.transparent,
                 child: child,
-              ), // Sürüklerken Premium Gölge
+              ),
               itemBuilder: (context, i) {
                 final mekan = rotamListesi[i];
                 int stepNumber = i + 1;
@@ -721,7 +1078,8 @@ class RotamEkrani extends StatelessWidget {
                                         borderRadius: BorderRadius.circular(8),
                                       ),
                                       child: Text(
-                                        mekan['kategori_adi'] ?? 'Genel',
+                                        mekan['kategoriler']?['kategori_adi'] ??
+                                            'Genel',
                                         style: TextStyle(
                                           color: Colors.indigo[600],
                                           fontSize: 12,
@@ -733,7 +1091,6 @@ class RotamEkrani extends StatelessWidget {
                                 ),
                               ),
                             ),
-                            // Geri dönen şık çöp kutusu (Sürükleme yeteneğiyle çakışmaz)
                             IconButton(
                               icon: const Icon(
                                 Icons.delete_outline,
